@@ -21,12 +21,14 @@ OLLAMA_MODEL = "qwen2.5-coder:1.5b"
 
 GPP = "g++"
 
-MAX_EXISTING_PROBLEMS = 30
-
 MAIN_BRANCH = "main"
 
-# Maximum time for one sample test
+MAX_EXISTING_PROBLEMS = 30
+
 TEST_TIMEOUT = 10
+
+# Maximum number of AI repair attempts after a compile/test error
+MAX_REPAIR_ATTEMPTS = 2
 
 
 # ============================================================
@@ -149,7 +151,8 @@ def check_environment():
     # --------------------------------------------------------
 
     log(
-        f"Python: {sys.version.split()[0]}"
+        "Python: " +
+        sys.version.split()[0]
     )
 
     # --------------------------------------------------------
@@ -215,7 +218,7 @@ def check_environment():
 
 
 # ============================================================
-# GIT STATUS HELPERS
+# GIT
 # ============================================================
 
 def get_git_status():
@@ -282,7 +285,7 @@ def git_sync():
 
 
 # ============================================================
-# READ EXISTING PROBLEMS
+# EXISTING PROBLEMS
 # ============================================================
 
 def get_existing_problems():
@@ -303,7 +306,10 @@ def get_existing_problems():
 
     for folder in folders[-MAX_EXISTING_PROBLEMS:]:
 
-        problem_file = folder / "problem.md"
+        problem_file = (
+            folder /
+            "problem.md"
+        )
 
         if not problem_file.exists():
             continue
@@ -368,9 +374,7 @@ def call_ollama(prompt):
         "format": "json",
 
         "options": {
-
             "temperature": 0.7,
-
             "num_ctx": 4096
         }
     }
@@ -380,16 +384,12 @@ def call_ollama(prompt):
     ).encode("utf-8")
 
     request = urllib.request.Request(
-
         OLLAMA_URL,
-
         data=data,
-
         headers={
             "Content-Type":
             "application/json"
         },
-
         method="POST"
     )
 
@@ -447,103 +447,22 @@ def call_ollama(prompt):
 
 
 # ============================================================
-# GENERATE PROBLEM
+# PARSE JSON
 # ============================================================
 
-def generate_problem():
-
-    existing_summary = (
-        build_existing_summary()
-    )
-
-    prompt = f"""
-You are an expert competitive programming
-problem setter.
-
-Generate EXACTLY ONE new original C++ programming problem.
-
-The problem must be suitable for a
-beginner/intermediate competitive programming
-repository.
-
-IMPORTANT RULES:
-
-- Do NOT copy an existing problem.
-- Do NOT create a problem with the same core idea
-  as an existing problem.
-- Prefer a different algorithmic concept.
-- The problem must be solvable using standard C++17.
-- Do not use external libraries.
-- Avoid advanced mathematics unless clearly explained.
-- Make all examples correct.
-- Make the solution correct.
-- Make constraints consistent with the intended algorithm.
-- Do not require interactive input.
-- Do not require external files.
-- Avoid floating point unless absolutely necessary.
-- Use deterministic input/output.
-- The solution must compile with g++ C++17.
-- Include at least 2 examples if possible.
-
-Return ONLY valid JSON.
-
-Required JSON structure:
-
-{{
-  "title": "Problem title",
-  "difficulty": "Easy/Medium/Hard",
-  "statement": "Complete problem statement",
-  "input": "Input format",
-  "output": "Output format",
-  "constraints": [
-    "constraint 1",
-    "constraint 2"
-  ],
-  "examples": [
-    {{
-      "input": "sample input",
-      "output": "sample output",
-      "explanation": "short explanation"
-    }}
-  ],
-  "approach": "Explain the algorithm clearly",
-  "complexity": "Time and space complexity",
-  "solution_cpp": "Complete C++17 solution"
-}}
-
-The solution_cpp field must contain ONLY C++ source code.
-
-Here are recently generated problems.
-Avoid duplicates and similar core ideas:
-
-{existing_summary}
-"""
-
-    log(
-        "Asking Ollama to generate a new problem..."
-    )
-
-    raw = call_ollama(
-        prompt
-    )
+def parse_json_response(raw):
 
     raw = clean_code_fence(
         raw
     )
 
-    # --------------------------------------------------------
-    # Parse JSON
-    # --------------------------------------------------------
-
     try:
 
-        problem = json.loads(
+        return json.loads(
             raw
         )
 
     except json.JSONDecodeError as first_error:
-
-        # Try extracting the first JSON object.
 
         start = raw.find("{")
         end = raw.rfind("}")
@@ -560,7 +479,7 @@ Avoid duplicates and similar core ideas:
 
             try:
 
-                problem = json.loads(
+                return json.loads(
                     possible_json
                 )
 
@@ -573,38 +492,30 @@ Avoid duplicates and similar core ideas:
                     raw[:5000]
                 )
 
-        else:
+        raise RuntimeError(
+            "AI did not return valid JSON.\n\n"
+            "AI output:\n" +
+            raw[:5000]
+        )
 
-            raise RuntimeError(
-                "AI did not return valid JSON.\n\n"
-                "AI output:\n" +
-                raw[:5000]
-            )
 
-    # --------------------------------------------------------
-    # Validate required fields
-    # --------------------------------------------------------
+# ============================================================
+# VALIDATE GENERATED PROBLEM
+# ============================================================
+
+def validate_problem(problem):
 
     required_fields = [
 
         "title",
-
         "difficulty",
-
         "statement",
-
         "input",
-
         "output",
-
         "constraints",
-
         "examples",
-
         "approach",
-
         "complexity",
-
         "solution_cpp"
     ]
 
@@ -617,9 +528,21 @@ Avoid duplicates and similar core ideas:
                 field
             )
 
-    # --------------------------------------------------------
-    # Validate examples
-    # --------------------------------------------------------
+    if not str(
+        problem["title"]
+    ).strip():
+
+        raise RuntimeError(
+            "Problem title is empty."
+        )
+
+    if not str(
+        problem["statement"]
+    ).strip():
+
+        raise RuntimeError(
+            "Problem statement is empty."
+        )
 
     if not isinstance(
         problem["examples"],
@@ -638,29 +561,153 @@ Avoid duplicates and similar core ideas:
             "At least one example is required."
         )
 
-    # --------------------------------------------------------
-    # Validate solution
-    # --------------------------------------------------------
-
-    if not str(
+    solution = clean_code_fence(
         problem["solution_cpp"]
-    ).strip():
+    )
+
+    if not solution:
 
         raise RuntimeError(
             "AI generated an empty C++ solution."
         )
 
-    problem["solution_cpp"] = (
-        clean_code_fence(
-            problem["solution_cpp"]
+    problem["solution_cpp"] = solution
+
+    # --------------------------------------------------------
+    # Important C++ validation
+    # --------------------------------------------------------
+
+    if not re.search(
+        r"\bmain\s*\(",
+        solution
+    ):
+
+        raise RuntimeError(
+            "Generated C++ solution does not "
+            "contain a main() function."
         )
+
+    # Prevent obvious GUI-only code.
+
+    if (
+        "WinMain(" in solution
+        and not re.search(
+            r"\bmain\s*\(",
+            solution
+        )
+    ):
+
+        raise RuntimeError(
+            "Generated solution appears to use "
+            "WinMain instead of main()."
+        )
+
+    return problem
+
+
+# ============================================================
+# GENERATE INITIAL PROBLEM
+# ============================================================
+
+def generate_problem():
+
+    existing_summary = (
+        build_existing_summary()
+    )
+
+    prompt = f"""
+You are an expert competitive programming
+problem setter.
+
+Generate EXACTLY ONE new original C++ programming problem.
+
+The problem should be suitable for a
+beginner/intermediate competitive programming
+repository.
+
+IMPORTANT:
+
+- Do NOT copy an existing problem.
+- Do NOT create the same core algorithmic idea
+  as an existing problem.
+- Prefer a different algorithmic concept.
+- Use standard C++17 only.
+- No external libraries.
+- No interactive input.
+- No external files.
+- Avoid unnecessary floating point.
+- Make constraints match the intended algorithm.
+- Make every sample correct.
+- Make the C++ solution correct.
+- The solution MUST contain:
+    int main()
+  or
+    signed main()
+- The program MUST be a normal console application.
+- Do NOT use WinMain.
+- Do NOT use Windows GUI APIs.
+- The solution_cpp must be complete and compilable.
+
+Return ONLY valid JSON.
+
+Required structure:
+
+{{
+  "title": "Problem title",
+  "difficulty": "Easy/Medium/Hard",
+  "statement": "Complete problem statement",
+  "input": "Input format",
+  "output": "Output format",
+  "constraints": [
+    "constraint 1",
+    "constraint 2"
+  ],
+  "examples": [
+    {{
+      "input": "sample input",
+      "output": "sample output",
+      "explanation": "short explanation"
+    }},
+    {{
+      "input": "sample input",
+      "output": "sample output",
+      "explanation": "short explanation"
+    }}
+  ],
+  "approach": "Explain the algorithm clearly",
+  "complexity": "Time and space complexity",
+  "solution_cpp": "Complete C++17 source code"
+}}
+
+The solution_cpp field must contain ONLY C++ source code.
+
+Here are recently generated problems.
+Avoid duplicate ideas:
+
+{existing_summary}
+"""
+
+    log(
+        "Asking Ollama to generate a new problem..."
+    )
+
+    raw = call_ollama(
+        prompt
+    )
+
+    problem = parse_json_response(
+        raw
+    )
+
+    validate_problem(
+        problem
     )
 
     return problem
 
 
 # ============================================================
-# CREATE PROBLEM FILES
+# CREATE FILES
 # ============================================================
 
 def get_unique_folder(title):
@@ -855,9 +902,7 @@ def create_problem_files(problem):
     )
 
     solution_file.write_text(
-        str(
-            problem["solution_cpp"]
-        ).strip() +
+        problem["solution_cpp"].strip() +
         "\n",
         encoding="utf-8"
     )
@@ -871,7 +916,109 @@ def create_problem_files(problem):
 
 
 # ============================================================
-# COMPILE SOLUTION
+# REPAIR PROMPT
+# ============================================================
+
+def repair_solution(
+    problem,
+    current_code,
+    error_message,
+    error_type
+):
+
+    prompt = f"""
+You are repairing a C++17 competitive programming solution.
+
+The problem is:
+
+TITLE:
+{problem["title"]}
+
+STATEMENT:
+{problem["statement"]}
+
+INPUT:
+{problem["input"]}
+
+OUTPUT:
+{problem["output"]}
+
+CONSTRAINTS:
+{problem["constraints"]}
+
+EXAMPLES:
+{json.dumps(problem["examples"], indent=2)}
+
+CURRENT C++ CODE:
+
+{current_code}
+
+The current code has this {error_type}:
+
+{error_message}
+
+Fix the code.
+
+IMPORTANT:
+
+- Return ONLY valid JSON.
+- The JSON must contain exactly one field:
+  "solution_cpp"
+- solution_cpp must contain ONLY C++17 source code.
+- The program MUST contain int main() or signed main().
+- Do NOT use WinMain.
+- Do NOT use Windows GUI APIs.
+- Do NOT use external libraries.
+- Preserve the intended problem solution.
+- Make the code compile with:
+  g++ -std=c++17 -O2 -Wall -Wextra
+- Fix the actual error instead of changing the problem.
+- Keep the input/output format unchanged.
+"""
+
+    log(
+        "Asking Ollama to repair the solution..."
+    )
+
+    raw = call_ollama(
+        prompt
+    )
+
+    data = parse_json_response(
+        raw
+    )
+
+    if "solution_cpp" not in data:
+
+        raise RuntimeError(
+            "Repair response did not contain "
+            "solution_cpp."
+        )
+
+    repaired = clean_code_fence(
+        data["solution_cpp"]
+    )
+
+    if not repaired:
+
+        raise RuntimeError(
+            "AI returned an empty repaired solution."
+        )
+
+    if not re.search(
+        r"\bmain\s*\(",
+        repaired
+    ):
+
+        raise RuntimeError(
+            "Repaired solution does not contain main()."
+        )
+
+    return repaired
+
+
+# ============================================================
+# COMPILE
 # ============================================================
 
 def compile_solution(folder):
@@ -892,8 +1039,6 @@ def compile_solution(folder):
             "solution.cpp was not created."
         )
 
-    # Remove old executable if somehow present.
-
     if executable.exists():
 
         try:
@@ -901,24 +1046,19 @@ def compile_solution(folder):
         except Exception:
             pass
 
-    log("Compiling solution...")
+    log(
+        "Compiling solution..."
+    )
 
     result = run_command(
         [
             GPP,
-
             "-std=c++17",
-
             "-O2",
-
             "-Wall",
-
             "-Wextra",
-
             str(solution_file),
-
             "-o",
-
             str(executable)
         ],
         cwd=REPO_DIR
@@ -926,30 +1066,29 @@ def compile_solution(folder):
 
     if result.returncode != 0:
 
-        raise RuntimeError(
-            "Compilation failed.\n\n" +
+        error = (
             result.stdout +
             "\n" +
             result.stderr
+        ).strip()
+
+        raise RuntimeError(
+            "Compilation failed.\n\n" +
+            error
         )
 
-    log("Compilation successful.")
+    log(
+        "Compilation successful."
+    )
 
     return executable
 
 
 # ============================================================
-# SAMPLE TESTING
+# SAMPLE TEST
 # ============================================================
 
 def normalize_output(text):
-
-    """
-    Normalize output for comparison.
-
-    Removes leading/trailing whitespace and
-    normalizes line endings.
-    """
 
     text = text.replace(
         "\r\n",
@@ -1003,16 +1142,15 @@ def run_sample_test(
     except subprocess.TimeoutExpired:
 
         raise RuntimeError(
-            f"Sample {sample_number} "
-            f"timed out after "
-            f"{TEST_TIMEOUT} seconds."
+            f"Sample {sample_number} timed out "
+            f"after {TEST_TIMEOUT} seconds."
         )
 
     if result.returncode != 0:
 
         raise RuntimeError(
-            f"Sample {sample_number} "
-            "program exited with an error.\n\n"
+            f"Sample {sample_number} program "
+            "exited with an error.\n\n"
             "STDOUT:\n" +
             result.stdout +
             "\nSTDERR:\n" +
@@ -1095,8 +1233,6 @@ def test_solution(
 
     finally:
 
-        # Never commit solution.exe.
-
         if executable.exists():
 
             try:
@@ -1116,8 +1252,140 @@ def test_solution(
 
 
 # ============================================================
-# GIT SAFETY CHECK
+# COMPILE + TEST + AUTOMATIC REPAIR
 # ============================================================
+
+def validate_and_repair_solution(
+    folder,
+    problem
+):
+
+    for attempt in range(
+        MAX_REPAIR_ATTEMPTS + 1
+    ):
+
+        try:
+
+            log(
+                f"Validation attempt "
+                f"{attempt + 1}/"
+                f"{MAX_REPAIR_ATTEMPTS + 1}"
+            )
+
+            test_solution(
+                folder,
+                problem
+            )
+
+            return
+
+        except RuntimeError as error:
+
+            error_message = str(
+                error
+            )
+
+            # No more repair attempts.
+
+            if attempt >= MAX_REPAIR_ATTEMPTS:
+
+                raise RuntimeError(
+                    "Solution could not be "
+                    "validated after "
+                    f"{MAX_REPAIR_ATTEMPTS} "
+                    "repair attempt(s).\n\n" +
+                    error_message
+                )
+
+            log(
+                "Validation failed."
+            )
+
+            log(
+                "Attempting automatic AI repair..."
+            )
+
+            solution_file = (
+                folder /
+                "solution.cpp"
+            )
+
+            if not solution_file.exists():
+
+                raise RuntimeError(
+                    "solution.cpp disappeared "
+                    "during validation."
+                )
+
+            current_code = (
+                solution_file.read_text(
+                    encoding="utf-8"
+                )
+            )
+
+            if (
+                "Compilation failed"
+                in error_message
+            ):
+
+                error_type = (
+                    "compilation error"
+                )
+
+            else:
+
+                error_type = (
+                    "sample test failure"
+                )
+
+            repaired_code = repair_solution(
+                problem,
+                current_code,
+                error_message,
+                error_type
+            )
+
+            solution_file.write_text(
+                repaired_code.strip() +
+                "\n",
+                encoding="utf-8"
+            )
+
+            problem["solution_cpp"] = (
+                repaired_code
+            )
+
+            log(
+                "AI repair applied."
+            )
+
+
+# ============================================================
+# GIT SAFETY
+# ============================================================
+
+def get_generated_relative_path(
+    generated_folder
+):
+
+    try:
+
+        relative = (
+            generated_folder
+            .relative_to(REPO_DIR)
+        )
+
+    except ValueError:
+
+        raise RuntimeError(
+            "Generated folder is outside "
+            "the repository."
+        )
+
+    return normalize_git_path(
+        str(relative)
+    )
+
 
 def is_path_inside(
     relative_path,
@@ -1145,74 +1413,33 @@ def is_path_inside(
     )
 
 
-def get_generated_relative_path(
-    generated_folder
-):
-
-    try:
-
-        relative = (
-            generated_folder
-            .relative_to(REPO_DIR)
-        )
-
-    except ValueError:
-
-        raise RuntimeError(
-            "Generated folder is outside "
-            "the repository."
-        )
-
-    return normalize_git_path(
-        str(relative)
-    )
-
-
 def validate_git_changes(
     generated_folder
 ):
 
-    log("Checking Git changes...")
+    log(
+        "Checking Git changes..."
+    )
 
     status = get_git_status()
 
-    print()
-
-    if status:
-
-        print("Git changes:")
-        print(status)
-
-    else:
-
-        log(
-            "No Git changes detected."
-        )
+    if not status:
 
         raise RuntimeError(
             "Generated problem did not create "
             "any Git changes."
         )
 
+    print()
+    print("Git changes:")
+    print(status)
+    print()
+
     generated_relative = (
         get_generated_relative_path(
             generated_folder
         )
     )
-
-    # --------------------------------------------------------
-    # Inspect every changed/untracked file.
-    #
-    # IMPORTANT:
-    # Git may display:
-    #
-    #   ?? problems/
-    #
-    # when the directory contains untracked files.
-    #
-    # We use --untracked-files=all above so we can inspect
-    # the actual files instead.
-    # --------------------------------------------------------
 
     unexpected = []
 
@@ -1221,22 +1448,13 @@ def validate_git_changes(
         if not line.strip():
             continue
 
-        # Git porcelain format:
-        #
-        # XY filename
-        #
-        # For normal paths, first two chars are status.
-        # Everything after them is the path.
-
         if len(line) < 4:
             continue
 
         path_part = line[3:].strip()
 
-        # Handle rename format:
-        #
-        # old -> new
-        #
+        # Rename support
+
         if " -> " in path_part:
 
             path_part = (
@@ -1276,7 +1494,7 @@ def validate_git_changes(
 
 
 # ============================================================
-# STAGE ONLY GENERATED PROBLEM
+# STAGE ONLY GENERATED FOLDER
 # ============================================================
 
 def stage_generated_problem(
@@ -1313,7 +1531,7 @@ def stage_generated_problem(
         )
 
     # --------------------------------------------------------
-    # Verify staged files.
+    # Verify staged files
     # --------------------------------------------------------
 
     result = run_command(
@@ -1333,8 +1551,11 @@ def stage_generated_problem(
         )
 
     staged_files = [
+
         normalize_git_path(line)
+
         for line in result.stdout.splitlines()
+
         if line.strip()
     ]
 
@@ -1362,7 +1583,9 @@ def stage_generated_problem(
         raise RuntimeError(
             "Safety check failed: "
             "unexpected files are staged.\n\n" +
-            "\n".join(unexpected)
+            "\n".join(
+                unexpected
+            )
         )
 
     log(
@@ -1483,7 +1706,7 @@ def remove_generated_folder(
 
         log(
             "Warning: could not remove "
-            f"generated problem:\n{e}"
+            f"generated problem: {e}"
         )
 
 
@@ -1524,9 +1747,7 @@ def main():
         problem = generate_problem()
 
         print()
-        print(
-            "Generated:"
-        )
+        print("Generated:")
 
         print(
             "Title: " +
@@ -1551,10 +1772,10 @@ def main():
         )
 
         # ----------------------------------------------------
-        # 5. Compile + sample test
+        # 5. Compile + test + repair
         # ----------------------------------------------------
 
-        test_solution(
+        validate_and_repair_solution(
             generated_folder,
             problem
         )
@@ -1599,8 +1820,8 @@ def main():
             "                    SUCCESS"
         )
         print("=" * 60)
-
         print()
+
         print(
             "Problem: " +
             generated_folder.name
@@ -1612,9 +1833,10 @@ def main():
         )
 
         print()
+
         print(
             "The new problem was generated, "
-            "compiled, tested, committed, "
+            "validated, tested, committed, "
             "and pushed to GitHub."
         )
 
