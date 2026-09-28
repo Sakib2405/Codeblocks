@@ -23,6 +23,11 @@ GPP = "g++"
 
 MAX_EXISTING_PROBLEMS = 30
 
+MAIN_BRANCH = "main"
+
+# Maximum time for one sample test
+TEST_TIMEOUT = 10
+
 
 # ============================================================
 # BASIC HELPERS
@@ -35,6 +40,9 @@ def log(message):
 
 
 def run_command(command, cwd=None, capture=True):
+    """
+    Run a command and return CompletedProcess.
+    """
 
     log(
         "Running: " +
@@ -52,8 +60,14 @@ def run_command(command, cwd=None, capture=True):
 
 
 def clean_code_fence(text):
+    """
+    Remove markdown code fences if AI adds them.
+    """
 
-    text = text.strip()
+    if text is None:
+        return ""
+
+    text = str(text).strip()
 
     if text.startswith("```"):
 
@@ -71,8 +85,11 @@ def clean_code_fence(text):
 
 
 def slugify(text):
+    """
+    Convert title into a safe folder name.
+    """
 
-    text = text.lower().strip()
+    text = str(text).lower().strip()
 
     text = re.sub(
         r"[^a-z0-9]+",
@@ -86,6 +103,19 @@ def slugify(text):
         text = "daily-problem"
 
     return text[:80]
+
+
+def normalize_git_path(path_text):
+    """
+    Normalize Git path for comparison.
+    """
+
+    return (
+        path_text
+        .replace("\\", "/")
+        .strip()
+        .lstrip("./")
+    )
 
 
 # ============================================================
@@ -105,19 +135,27 @@ def check_environment():
     if not (REPO_DIR / ".git").exists():
 
         raise RuntimeError(
-            "This folder is not a Git repository:\n"
+            f"This folder is not a Git repository:\n"
             f"{REPO_DIR}"
         )
 
     PROBLEMS_DIR.mkdir(
+        parents=True,
         exist_ok=True
     )
+
+    # --------------------------------------------------------
+    # Python
+    # --------------------------------------------------------
 
     log(
         f"Python: {sys.version.split()[0]}"
     )
 
-    # Check g++
+    # --------------------------------------------------------
+    # g++
+    # --------------------------------------------------------
+
     try:
 
         result = run_command(
@@ -133,30 +171,41 @@ def check_environment():
         lines = result.stdout.splitlines()
 
         if lines:
+
             log(
-                "Compiler: " + lines[0]
+                "Compiler: " +
+                lines[0]
             )
 
     except FileNotFoundError:
 
         raise RuntimeError(
-            "g++ was not found.\n"
-            "Make sure g++ is installed and available in PATH."
+            "g++ was not found.\n\n"
+            "Make sure g++ is installed "
+            "and available in PATH."
         )
 
-    # Check Ollama
+    # --------------------------------------------------------
+    # Ollama
+    # --------------------------------------------------------
+
     try:
 
         result = run_command(
             ["ollama", "--version"]
         )
 
-        if result.returncode == 0:
+        if result.returncode != 0:
 
-            log(
-                "Ollama: " +
-                result.stdout.strip()
+            raise RuntimeError(
+                "Ollama command failed.\n" +
+                result.stderr
             )
+
+        log(
+            "Ollama: " +
+            result.stdout.strip()
+        )
 
     except FileNotFoundError:
 
@@ -166,18 +215,17 @@ def check_environment():
 
 
 # ============================================================
-# GIT SYNC
+# GIT STATUS HELPERS
 # ============================================================
 
-def git_sync():
-
-    log("Checking Git status...")
+def get_git_status():
 
     result = run_command(
         [
             "git",
             "status",
-            "--porcelain"
+            "--porcelain",
+            "--untracked-files=all"
         ],
         cwd=REPO_DIR
     )
@@ -185,18 +233,27 @@ def git_sync():
     if result.returncode != 0:
 
         raise RuntimeError(
-            "Unable to read Git status.\n" +
+            "Unable to read Git status.\n\n" +
             result.stderr
         )
 
-    if result.stdout.strip():
+    return result.stdout.strip()
+
+
+def git_sync():
+
+    log("Checking Git status...")
+
+    status = get_git_status()
+
+    if status:
 
         raise RuntimeError(
             "Your repository has uncommitted changes.\n\n"
             "Please commit or stash them before running "
             "the automatic generator.\n\n"
             "Changed files:\n" +
-            result.stdout
+            status
         )
 
     log("Pulling latest changes...")
@@ -207,7 +264,7 @@ def git_sync():
             "pull",
             "--ff-only",
             "origin",
-            "main"
+            MAIN_BRANCH
         ],
         cwd=REPO_DIR
     )
@@ -244,9 +301,7 @@ def get_existing_problems():
         key=lambda x: x.name.lower()
     )
 
-    for folder in folders[
-        -MAX_EXISTING_PROBLEMS:
-    ]:
+    for folder in folders[-MAX_EXISTING_PROBLEMS:]:
 
         problem_file = folder / "problem.md"
 
@@ -303,12 +358,19 @@ def build_existing_summary():
 def call_ollama(prompt):
 
     payload = {
+
         "model": OLLAMA_MODEL,
+
         "prompt": prompt,
+
         "stream": False,
+
         "format": "json",
+
         "options": {
+
             "temperature": 0.7,
+
             "num_ctx": 4096
         }
     }
@@ -318,11 +380,16 @@ def call_ollama(prompt):
     ).encode("utf-8")
 
     request = urllib.request.Request(
+
         OLLAMA_URL,
+
         data=data,
+
         headers={
-            "Content-Type": "application/json"
+            "Content-Type":
+            "application/json"
         },
+
         method="POST"
     )
 
@@ -354,13 +421,15 @@ def call_ollama(prompt):
 
     try:
 
-        response_json = json.loads(raw)
+        response_json = json.loads(
+            raw
+        )
 
     except json.JSONDecodeError:
 
         raise RuntimeError(
             "Ollama returned invalid response:\n\n" +
-            raw[:2000]
+            raw[:3000]
         )
 
     model_output = response_json.get(
@@ -388,26 +457,33 @@ def generate_problem():
     )
 
     prompt = f"""
-You are an expert competitive programming problem setter.
+You are an expert competitive programming
+problem setter.
 
 Generate EXACTLY ONE new original C++ programming problem.
 
-The problem must be suitable for a beginner/intermediate
-competitive programming repository.
+The problem must be suitable for a
+beginner/intermediate competitive programming
+repository.
 
-IMPORTANT:
+IMPORTANT RULES:
+
 - Do NOT copy an existing problem.
-- Do NOT create a problem with the same core idea as an existing one.
-- Use a different algorithmic concept when possible.
+- Do NOT create a problem with the same core idea
+  as an existing problem.
+- Prefer a different algorithmic concept.
 - The problem must be solvable using standard C++17.
-- Avoid external libraries.
+- Do not use external libraries.
 - Avoid advanced mathematics unless clearly explained.
-- Make the examples correct.
+- Make all examples correct.
 - Make the solution correct.
 - Make constraints consistent with the intended algorithm.
 - Do not require interactive input.
-- Do not require files.
-- Do not use floating point unless absolutely necessary.
+- Do not require external files.
+- Avoid floating point unless absolutely necessary.
+- Use deterministic input/output.
+- The solution must compile with g++ C++17.
+- Include at least 2 examples if possible.
 
 Return ONLY valid JSON.
 
@@ -437,8 +513,8 @@ Required JSON structure:
 
 The solution_cpp field must contain ONLY C++ source code.
 
-Here are some recently generated problems.
-Avoid duplicates:
+Here are recently generated problems.
+Avoid duplicates and similar core ideas:
 
 {existing_summary}
 """
@@ -447,17 +523,27 @@ Avoid duplicates:
         "Asking Ollama to generate a new problem..."
     )
 
-    raw = call_ollama(prompt)
+    raw = call_ollama(
+        prompt
+    )
 
-    raw = raw.strip()
+    raw = clean_code_fence(
+        raw
+    )
 
-    raw = clean_code_fence(raw)
+    # --------------------------------------------------------
+    # Parse JSON
+    # --------------------------------------------------------
 
     try:
 
-        problem = json.loads(raw)
+        problem = json.loads(
+            raw
+        )
 
-    except json.JSONDecodeError as e:
+    except json.JSONDecodeError as first_error:
+
+        # Try extracting the first JSON object.
 
         start = raw.find("{")
         end = raw.rfind("}")
@@ -482,7 +568,7 @@ Avoid duplicates:
 
                 raise RuntimeError(
                     "AI returned invalid JSON.\n\n"
-                    f"JSON error: {e}\n\n"
+                    f"JSON error: {first_error}\n\n"
                     "AI output:\n" +
                     raw[:5000]
                 )
@@ -495,16 +581,30 @@ Avoid duplicates:
                 raw[:5000]
             )
 
+    # --------------------------------------------------------
+    # Validate required fields
+    # --------------------------------------------------------
+
     required_fields = [
+
         "title",
+
         "difficulty",
+
         "statement",
+
         "input",
+
         "output",
+
         "constraints",
+
         "examples",
+
         "approach",
+
         "complexity",
+
         "solution_cpp"
     ]
 
@@ -517,6 +617,10 @@ Avoid duplicates:
                 field
             )
 
+    # --------------------------------------------------------
+    # Validate examples
+    # --------------------------------------------------------
+
     if not isinstance(
         problem["examples"],
         list
@@ -526,11 +630,17 @@ Avoid duplicates:
             "examples must be a list."
         )
 
-    if len(problem["examples"]) == 0:
+    if len(
+        problem["examples"]
+    ) == 0:
 
         raise RuntimeError(
             "At least one example is required."
         )
+
+    # --------------------------------------------------------
+    # Validate solution
+    # --------------------------------------------------------
 
     if not str(
         problem["solution_cpp"]
@@ -542,7 +652,7 @@ Avoid duplicates:
 
     problem["solution_cpp"] = (
         clean_code_fence(
-            str(problem["solution_cpp"])
+            problem["solution_cpp"]
         )
     )
 
@@ -550,20 +660,26 @@ Avoid duplicates:
 
 
 # ============================================================
-# CREATE FILES
+# CREATE PROBLEM FILES
 # ============================================================
 
 def get_unique_folder(title):
 
-    base_slug = slugify(title)
+    base_slug = slugify(
+        title
+    )
 
-    folder = PROBLEMS_DIR / base_slug
+    folder = (
+        PROBLEMS_DIR /
+        base_slug
+    )
 
     counter = 2
 
     while folder.exists():
 
-        folder = PROBLEMS_DIR / (
+        folder = (
+            PROBLEMS_DIR /
             f"{base_slug}-{counter}"
         )
 
@@ -583,15 +699,23 @@ def create_problem_files(problem):
         exist_ok=False
     )
 
-    problem_file = folder / "problem.md"
+    problem_file = (
+        folder /
+        "problem.md"
+    )
 
-    solution_file = folder / "solution.cpp"
+    solution_file = (
+        folder /
+        "solution.cpp"
+    )
 
     # --------------------------------------------------------
     # Constraints
     # --------------------------------------------------------
 
-    constraints = problem["constraints"]
+    constraints = (
+        problem["constraints"]
+    )
 
     if isinstance(
         constraints,
@@ -619,6 +743,15 @@ def create_problem_files(problem):
         problem["examples"],
         start=1
     ):
+
+        if not isinstance(
+            example,
+            dict
+        ):
+
+            raise RuntimeError(
+                "Each example must be an object."
+            )
 
         example_input = str(
             example.get(
@@ -662,8 +795,10 @@ def create_problem_files(problem):
             example_block
         )
 
-    examples_block = "\n".join(
-        examples_text
+    examples_block = (
+        "\n".join(
+            examples_text
+        )
     )
 
     # --------------------------------------------------------
@@ -671,6 +806,7 @@ def create_problem_files(problem):
     # --------------------------------------------------------
 
     markdown = (
+
         "# " +
         str(problem["title"]) +
         "\n\n"
@@ -709,7 +845,8 @@ def create_problem_files(problem):
 
         "---\n\n"
 
-        "Generated automatically using local Ollama AI.\n"
+        "Generated automatically using "
+        "local Ollama AI.\n"
     )
 
     problem_file.write_text(
@@ -740,199 +877,49 @@ def create_problem_files(problem):
 def compile_solution(folder):
 
     solution_file = (
-        folder / "solution.cpp"
+        folder /
+        "solution.cpp"
     )
 
-    exe_file = (
-        folder / "solution.exe"
+    executable = (
+        folder /
+        "solution.exe"
     )
 
-    log(
-        "Compiling solution..."
-    )
+    if not solution_file.exists():
+
+        raise RuntimeError(
+            "solution.cpp was not created."
+        )
+
+    # Remove old executable if somehow present.
+
+    if executable.exists():
+
+        try:
+            executable.unlink()
+        except Exception:
+            pass
+
+    log("Compiling solution...")
 
     result = run_command(
         [
             GPP,
+
             "-std=c++17",
+
             "-O2",
+
             "-Wall",
+
             "-Wextra",
+
             str(solution_file),
+
             "-o",
-            str(exe_file)
-        ],
-        cwd=folder
-    )
 
-    if result.returncode != 0:
-
-        raise RuntimeError(
-            "Compilation failed.\n\n"
-            "STDOUT:\n" +
-            result.stdout +
-            "\n\n"
-            "STDERR:\n" +
-            result.stderr
-        )
-
-    log(
-        "Compilation successful."
-    )
-
-    return exe_file
-
-
-# ============================================================
-# RUN SAMPLE TESTS
-# ============================================================
-
-def run_sample_tests(
-    folder,
-    problem
-):
-
-    exe_file = (
-        folder / "solution.exe"
-    )
-
-    if not exe_file.exists():
-
-        raise RuntimeError(
-            "solution.exe was not created."
-        )
-
-    examples = problem["examples"]
-
-    log(
-        f"Running {len(examples)} sample test(s)..."
-    )
-
-    for index, example in enumerate(
-        examples,
-        start=1
-    ):
-
-        test_input = str(
-            example.get(
-                "input",
-                ""
-            )
-        )
-
-        expected_output = str(
-            example.get(
-                "output",
-                ""
-            )
-        ).strip()
-
-        try:
-
-            result = subprocess.run(
-                [str(exe_file)],
-                input=test_input,
-                text=True,
-                capture_output=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=10,
-                cwd=str(folder)
-            )
-
-        except subprocess.TimeoutExpired:
-
-            raise RuntimeError(
-                f"Sample test {index} timed out."
-            )
-
-        if result.returncode != 0:
-
-            raise RuntimeError(
-                f"Sample test {index} crashed.\n\n"
-                "STDOUT:\n" +
-                result.stdout +
-                "\n\n"
-                "STDERR:\n" +
-                result.stderr
-            )
-
-        actual_output = (
-            result.stdout.strip()
-        )
-
-        if actual_output != expected_output:
-
-            raise RuntimeError(
-                f"Sample test {index} failed.\n\n"
-                "Input:\n" +
-                test_input +
-                "\n\n"
-                "Expected:\n" +
-                expected_output +
-                "\n\n"
-                "Actual:\n" +
-                actual_output
-            )
-
-        log(
-            f"Sample {index}: PASS"
-        )
-
-    log(
-        "All sample tests passed."
-    )
-
-
-# ============================================================
-# REMOVE EXECUTABLE
-# ============================================================
-
-def remove_executable(folder):
-
-    exe_file = (
-        folder / "solution.exe"
-    )
-
-    if exe_file.exists():
-
-        try:
-
-            exe_file.unlink()
-
-            log(
-                "Removed temporary solution.exe"
-            )
-
-        except Exception as e:
-
-            log(
-                "Warning: could not remove "
-                f"solution.exe: {e}"
-            )
-
-
-# ============================================================
-# GIT VALIDATION
-# ============================================================
-
-def git_check_generated_files(
-    folder
-):
-
-    relative_folder = (
-        folder.relative_to(REPO_DIR)
-    )
-
-    log(
-        "Checking Git changes..."
-    )
-
-    result = run_command(
-        [
-            "git",
-            "status",
-            "--short"
+            str(executable)
         ],
         cwd=REPO_DIR
     )
@@ -940,75 +927,370 @@ def git_check_generated_files(
     if result.returncode != 0:
 
         raise RuntimeError(
-            "Could not check Git status."
+            "Compilation failed.\n\n" +
+            result.stdout +
+            "\n" +
+            result.stderr
         )
 
-    changed = result.stdout.strip()
+    log("Compilation successful.")
 
-    if not changed:
+    return executable
+
+
+# ============================================================
+# SAMPLE TESTING
+# ============================================================
+
+def normalize_output(text):
+
+    """
+    Normalize output for comparison.
+
+    Removes leading/trailing whitespace and
+    normalizes line endings.
+    """
+
+    text = text.replace(
+        "\r\n",
+        "\n"
+    )
+
+    text = text.replace(
+        "\r",
+        "\n"
+    )
+
+    return text.strip()
+
+
+def run_sample_test(
+    executable,
+    sample_input,
+    expected_output,
+    sample_number
+):
+
+    log(
+        f"Sample {sample_number}: running..."
+    )
+
+    try:
+
+        result = subprocess.run(
+
+            [
+                str(executable)
+            ],
+
+            input=sample_input,
+
+            text=True,
+
+            capture_output=True,
+
+            encoding="utf-8",
+
+            errors="replace",
+
+            timeout=TEST_TIMEOUT,
+
+            cwd=str(
+                executable.parent
+            )
+        )
+
+    except subprocess.TimeoutExpired:
 
         raise RuntimeError(
+            f"Sample {sample_number} "
+            f"timed out after "
+            f"{TEST_TIMEOUT} seconds."
+        )
+
+    if result.returncode != 0:
+
+        raise RuntimeError(
+            f"Sample {sample_number} "
+            "program exited with an error.\n\n"
+            "STDOUT:\n" +
+            result.stdout +
+            "\nSTDERR:\n" +
+            result.stderr
+        )
+
+    actual = normalize_output(
+        result.stdout
+    )
+
+    expected = normalize_output(
+        expected_output
+    )
+
+    if actual != expected:
+
+        raise RuntimeError(
+            f"Sample {sample_number} failed.\n\n"
+            "Expected:\n" +
+            expected +
+            "\n\n"
+            "Actual:\n" +
+            actual
+        )
+
+    log(
+        f"Sample {sample_number}: PASS"
+    )
+
+
+def test_solution(
+    folder,
+    problem
+):
+
+    executable = compile_solution(
+        folder
+    )
+
+    examples = problem[
+        "examples"
+    ]
+
+    log(
+        f"Running {len(examples)} "
+        "sample test(s)..."
+    )
+
+    try:
+
+        for index, example in enumerate(
+            examples,
+            start=1
+        ):
+
+            sample_input = str(
+                example.get(
+                    "input",
+                    ""
+                )
+            )
+
+            sample_output = str(
+                example.get(
+                    "output",
+                    ""
+                )
+            )
+
+            run_sample_test(
+                executable,
+                sample_input,
+                sample_output,
+                index
+            )
+
+        log(
+            "All sample tests passed."
+        )
+
+    finally:
+
+        # Never commit solution.exe.
+
+        if executable.exists():
+
+            try:
+
+                executable.unlink()
+
+                log(
+                    "Removed temporary solution.exe"
+                )
+
+            except Exception as e:
+
+                log(
+                    "Warning: could not remove "
+                    f"{executable}: {e}"
+                )
+
+
+# ============================================================
+# GIT SAFETY CHECK
+# ============================================================
+
+def is_path_inside(
+    relative_path,
+    parent_path
+):
+
+    relative_path = (
+        normalize_git_path(
+            relative_path
+        )
+    )
+
+    parent_path = (
+        normalize_git_path(
+            parent_path
+        )
+    )
+
+    if relative_path == parent_path:
+
+        return True
+
+    return relative_path.startswith(
+        parent_path + "/"
+    )
+
+
+def get_generated_relative_path(
+    generated_folder
+):
+
+    try:
+
+        relative = (
+            generated_folder
+            .relative_to(REPO_DIR)
+        )
+
+    except ValueError:
+
+        raise RuntimeError(
+            "Generated folder is outside "
+            "the repository."
+        )
+
+    return normalize_git_path(
+        str(relative)
+    )
+
+
+def validate_git_changes(
+    generated_folder
+):
+
+    log("Checking Git changes...")
+
+    status = get_git_status()
+
+    print()
+
+    if status:
+
+        print("Git changes:")
+        print(status)
+
+    else:
+
+        log(
             "No Git changes detected."
         )
 
-    print()
-    print("Git changes:")
-    print(changed)
+        raise RuntimeError(
+            "Generated problem did not create "
+            "any Git changes."
+        )
 
-    expected_prefix = str(
-        relative_folder
-    ).replace("\\", "/")
+    generated_relative = (
+        get_generated_relative_path(
+            generated_folder
+        )
+    )
+
+    # --------------------------------------------------------
+    # Inspect every changed/untracked file.
+    #
+    # IMPORTANT:
+    # Git may display:
+    #
+    #   ?? problems/
+    #
+    # when the directory contains untracked files.
+    #
+    # We use --untracked-files=all above so we can inspect
+    # the actual files instead.
+    # --------------------------------------------------------
 
     unexpected = []
 
-    for line in changed.splitlines():
+    for line in status.splitlines():
+
+        if not line.strip():
+            continue
+
+        # Git porcelain format:
+        #
+        # XY filename
+        #
+        # For normal paths, first two chars are status.
+        # Everything after them is the path.
 
         if len(line) < 4:
             continue
 
-        path = line[3:].strip()
+        path_part = line[3:].strip()
 
-        path = path.replace(
-            "\\",
-            "/"
+        # Handle rename format:
+        #
+        # old -> new
+        #
+        if " -> " in path_part:
+
+            path_part = (
+                path_part.split(
+                    " -> "
+                )[-1]
+            )
+
+        path_part = normalize_git_path(
+            path_part
         )
 
-        if not path.startswith(
-            expected_prefix + "/"
+        if not is_path_inside(
+            path_part,
+            generated_relative
         ):
 
-            unexpected.append(path)
+            unexpected.append(
+                path_part
+            )
 
     if unexpected:
 
         raise RuntimeError(
             "Unexpected files were modified.\n\n" +
-            "\n".join(unexpected)
+            "\n".join(
+                unexpected
+            ) +
+            "\n\n"
+            "Only the newly generated "
+            "problem folder may be modified."
         )
 
-
-# ============================================================
-# GIT COMMIT + PUSH
-# ============================================================
-
-def git_commit_and_push(
-    folder,
-    problem
-):
-
-    relative_folder = (
-        folder.relative_to(REPO_DIR)
+    log(
+        "Git safety check passed."
     )
 
-    relative_folder_string = str(
-        relative_folder
-    ).replace(
-        "\\",
-        "/"
+
+# ============================================================
+# STAGE ONLY GENERATED PROBLEM
+# ============================================================
+
+def stage_generated_problem(
+    generated_folder
+):
+
+    generated_relative = (
+        get_generated_relative_path(
+            generated_folder
+        )
     )
 
     log(
-        "Adding generated problem to Git..."
+        "Staging generated problem only..."
     )
 
     result = run_command(
@@ -1016,7 +1298,7 @@ def git_commit_and_push(
             "git",
             "add",
             "--",
-            relative_folder_string
+            generated_relative
         ],
         cwd=REPO_DIR
     )
@@ -1024,9 +1306,15 @@ def git_commit_and_push(
     if result.returncode != 0:
 
         raise RuntimeError(
-            "git add failed.\n" +
+            "git add failed.\n\n" +
+            result.stdout +
+            "\n" +
             result.stderr
         )
+
+    # --------------------------------------------------------
+    # Verify staged files.
+    # --------------------------------------------------------
 
     result = run_command(
         [
@@ -1041,11 +1329,11 @@ def git_commit_and_push(
     if result.returncode != 0:
 
         raise RuntimeError(
-            "Could not inspect staged files."
+            "Unable to inspect staged files."
         )
 
     staged_files = [
-        line.strip()
+        normalize_git_path(line)
         for line in result.stdout.splitlines()
         if line.strip()
     ]
@@ -1056,41 +1344,56 @@ def git_commit_and_push(
             "Nothing was staged."
         )
 
-    print()
-    print("Staged files:")
+    unexpected = []
 
-    for file in staged_files:
-        print(
-            "  " + file
-        )
+    for path in staged_files:
 
-    for file in staged_files:
-
-        normalized = file.replace(
-            "\\",
-            "/"
-        )
-
-        if not normalized.startswith(
-            relative_folder_string + "/"
+        if not is_path_inside(
+            path,
+            generated_relative
         ):
 
-            raise RuntimeError(
-                "Safety check failed.\n"
-                "An unexpected file was staged:\n" +
-                file
+            unexpected.append(
+                path
             )
+
+    if unexpected:
+
+        raise RuntimeError(
+            "Safety check failed: "
+            "unexpected files are staged.\n\n" +
+            "\n".join(unexpected)
+        )
+
+    log(
+        "Staged files:"
+    )
+
+    for path in staged_files:
+
+        print(
+            "  " + path
+        )
+
+
+# ============================================================
+# COMMIT
+# ============================================================
+
+def commit_generated_problem(
+    generated_folder
+):
+
+    slug = generated_folder.name
 
     commit_message = (
         "daily: add " +
-        slugify(
-            problem["title"]
-        ) +
+        slug +
         " problem"
     )
 
     log(
-        "Creating commit..."
+        "Creating Git commit..."
     )
 
     result = run_command(
@@ -1106,15 +1409,22 @@ def git_commit_and_push(
     if result.returncode != 0:
 
         raise RuntimeError(
-            "git commit failed.\n\n" +
+            "Git commit failed.\n\n" +
             result.stdout +
             "\n" +
             result.stderr
         )
 
     log(
-        "Commit created."
+        "Git commit created."
     )
+
+
+# ============================================================
+# PUSH
+# ============================================================
+
+def push_changes():
 
     log(
         "Pushing to GitHub..."
@@ -1125,7 +1435,7 @@ def git_commit_and_push(
             "git",
             "push",
             "origin",
-            "main"
+            MAIN_BRANCH
         ],
         cwd=REPO_DIR
     )
@@ -1133,15 +1443,48 @@ def git_commit_and_push(
     if result.returncode != 0:
 
         raise RuntimeError(
-            "git push failed.\n\n" +
+            "Git push failed.\n\n" +
             result.stdout +
             "\n" +
             result.stderr
         )
 
     log(
-        "Push successful."
+        "GitHub push successful."
     )
+
+
+# ============================================================
+# CLEANUP
+# ============================================================
+
+def remove_generated_folder(
+    generated_folder
+):
+
+    if generated_folder is None:
+        return
+
+    if not generated_folder.exists():
+        return
+
+    try:
+
+        shutil.rmtree(
+            generated_folder
+        )
+
+        log(
+            "Generated problem was removed "
+            "because the process failed."
+        )
+
+    except Exception as e:
+
+        log(
+            "Warning: could not remove "
+            f"generated problem:\n{e}"
+        )
 
 
 # ============================================================
@@ -1152,19 +1495,31 @@ def main():
 
     generated_folder = None
 
+    print()
+    print("=" * 60)
+    print(
+        "        DAILY C++ PROBLEM GENERATOR"
+    )
+    print("=" * 60)
+    print()
+
     try:
 
-        print()
-        print("=" * 60)
-        print(
-            "        DAILY C++ PROBLEM GENERATOR"
-        )
-        print("=" * 60)
-        print()
+        # ----------------------------------------------------
+        # 1. Environment
+        # ----------------------------------------------------
 
         check_environment()
 
+        # ----------------------------------------------------
+        # 2. Git sync
+        # ----------------------------------------------------
+
         git_sync()
+
+        # ----------------------------------------------------
+        # 3. Generate problem
+        # ----------------------------------------------------
 
         problem = generate_problem()
 
@@ -1172,15 +1527,22 @@ def main():
         print(
             "Generated:"
         )
+
         print(
-            "Title:",
-            problem["title"]
+            "Title: " +
+            str(problem["title"])
         )
+
         print(
-            "Difficulty:",
-            problem["difficulty"]
+            "Difficulty: " +
+            str(problem["difficulty"])
         )
+
         print()
+
+        # ----------------------------------------------------
+        # 4. Create files
+        # ----------------------------------------------------
 
         generated_folder = (
             create_problem_files(
@@ -1188,61 +1550,100 @@ def main():
             )
         )
 
-        compile_solution(
-            generated_folder
-        )
+        # ----------------------------------------------------
+        # 5. Compile + sample test
+        # ----------------------------------------------------
 
-        run_sample_tests(
+        test_solution(
             generated_folder,
             problem
         )
 
-        remove_executable(
+        # ----------------------------------------------------
+        # 6. Git safety
+        # ----------------------------------------------------
+
+        validate_git_changes(
             generated_folder
         )
 
-        git_check_generated_files(
+        # ----------------------------------------------------
+        # 7. Stage only generated folder
+        # ----------------------------------------------------
+
+        stage_generated_problem(
             generated_folder
         )
 
-        git_commit_and_push(
-            generated_folder,
-            problem
+        # ----------------------------------------------------
+        # 8. Commit
+        # ----------------------------------------------------
+
+        commit_generated_problem(
+            generated_folder
         )
+
+        # ----------------------------------------------------
+        # 9. Push
+        # ----------------------------------------------------
+
+        push_changes()
+
+        # ----------------------------------------------------
+        # SUCCESS
+        # ----------------------------------------------------
 
         print()
         print("=" * 60)
         print(
-            "SUCCESS"
+            "                    SUCCESS"
         )
         print("=" * 60)
-        print()
 
+        print()
         print(
-            "Problem added:",
-            problem["title"]
+            "Problem: " +
+            generated_folder.name
         )
 
         print(
-            "Folder:",
-            generated_folder
+            "Location: " +
+            str(generated_folder)
         )
+
+        print()
+        print(
+            "The new problem was generated, "
+            "compiled, tested, committed, "
+            "and pushed to GitHub."
+        )
+
+        print()
+
+        return 0
+
+    except KeyboardInterrupt:
 
         print()
 
         print(
-            "The new problem has been compiled, "
-            "tested, committed and pushed to GitHub."
+            "Process interrupted by user."
         )
 
-        print()
+        if generated_folder:
+
+            remove_generated_folder(
+                generated_folder
+            )
+
+        return 1
 
     except Exception as e:
 
         print()
         print("=" * 60)
         print(
-            "FAILED"
+            "                     FAILED"
         )
         print("=" * 60)
         print()
@@ -1253,39 +1654,21 @@ def main():
 
         print()
 
-        if (
-            generated_folder
-            and generated_folder.exists()
-        ):
+        if generated_folder:
 
-            try:
+            remove_generated_folder(
+                generated_folder
+            )
 
-                remove_executable(
-                    generated_folder
-                )
+        return 1
 
-                shutil.rmtree(
-                    generated_folder
-                )
 
-                print(
-                    "Generated problem was removed "
-                    "because the process failed."
-                )
-
-            except Exception as cleanup_error:
-
-                print(
-                    "WARNING: Could not clean up "
-                    "generated problem:"
-                )
-
-                print(
-                    cleanup_error
-                )
-
-        sys.exit(1)
-
+# ============================================================
+# ENTRY POINT
+# ============================================================
 
 if __name__ == "__main__":
-    main()
+
+    sys.exit(
+        main()
+    )
