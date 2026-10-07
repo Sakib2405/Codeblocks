@@ -1,10 +1,12 @@
 import json
+import os
 import re
 import shutil
 import subprocess
 import sys
 import urllib.request
 import urllib.error
+import urllib.parse
 from pathlib import Path
 from datetime import datetime
 
@@ -13,14 +15,55 @@ from datetime import datetime
 # CONFIG
 # ============================================================
 
-REPO_DIR = Path(r"D:\CodeblocksRepo")
-PROBLEMS_DIR = REPO_DIR / "problems"
+SCRIPT_DIR = Path(__file__).resolve().parent
+REPO_DIR = Path(
+    os.environ.get(
+        "DAILY_PROBLEM_REPO_DIR",
+        str(SCRIPT_DIR.parent)
+    )
+).resolve()
 
-OLLAMA_URL = "http://localhost:11434/api/generate"
-OLLAMA_MODEL = "qwen2.5-coder:1.5b"
+PROBLEMS_SUBDIR = (
+    os.environ.get(
+        "DAILY_PROBLEM_TARGET_SUBDIR",
+        "problems"
+    ).strip() or "problems"
+)
 
-GPP = "g++"
-MAIN_BRANCH = "main"
+PROBLEMS_DIR = REPO_DIR / PROBLEMS_SUBDIR
+
+OLLAMA_URL = os.environ.get(
+    "DAILY_PROBLEM_OLLAMA_URL",
+    "http://localhost:11434/api/generate"
+).strip()
+
+OLLAMA_MODEL = os.environ.get(
+    "DAILY_PROBLEM_OLLAMA_MODEL",
+    "qwen2.5-coder:1.5b"
+).strip()
+
+OLLAMA_API_KEY = os.environ.get(
+    "DAILY_PROBLEM_OLLAMA_API_KEY",
+    ""
+).strip()
+
+GPP = os.environ.get("DAILY_PROBLEM_GPP", "g++")
+MAIN_BRANCH = os.environ.get("DAILY_PROBLEM_MAIN_BRANCH", "main")
+
+SKIP_GIT_SYNC = os.environ.get(
+    "DAILY_PROBLEM_SKIP_GIT_SYNC",
+    "0"
+).lower() in {"1", "true", "yes"}
+
+SKIP_GIT_COMMIT = os.environ.get(
+    "DAILY_PROBLEM_SKIP_GIT_COMMIT",
+    "0"
+).lower() in {"1", "true", "yes"}
+
+SKIP_GIT_PUSH = os.environ.get(
+    "DAILY_PROBLEM_SKIP_GIT_PUSH",
+    "0"
+).lower() in {"1", "true", "yes"}
 
 TEST_TIMEOUT = 10
 OLLAMA_TIMEOUT = 180
@@ -89,15 +132,54 @@ def check_environment():
     if lines:
         log(f"Compiler: {lines[0]}")
 
-    result = run_command(["ollama", "--version"])
+    if not OLLAMA_MODEL:
+        raise RuntimeError(
+            "DAILY_PROBLEM_OLLAMA_MODEL is empty."
+        )
 
-    if result.returncode != 0:
-        raise RuntimeError("Ollama was not found.")
+    parsed = urllib.parse.urlparse(OLLAMA_URL)
 
-    lines = result.stdout.splitlines()
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise RuntimeError(
+            "DAILY_PROBLEM_OLLAMA_URL is invalid. "
+            "Use a full URL like "
+            "http://host:port/api/generate"
+        )
 
-    if lines:
-        log(f"Ollama: {lines[0]}")
+    headers = {}
+
+    if OLLAMA_API_KEY:
+        headers["Authorization"] = (
+            "Bearer " + OLLAMA_API_KEY
+        )
+
+    tags_url = (
+        f"{parsed.scheme}://{parsed.netloc}/api/tags"
+    )
+
+    request = urllib.request.Request(
+        tags_url,
+        headers=headers,
+        method="GET"
+    )
+
+    try:
+        with urllib.request.urlopen(
+            request,
+            timeout=30
+        ) as response:
+            if response.status >= 400:
+                raise RuntimeError(
+                    f"Ollama endpoint returned HTTP "
+                    f"{response.status}"
+                )
+    except Exception as error:
+        raise RuntimeError(
+            "Could not reach Ollama endpoint. "
+            "Set DAILY_PROBLEM_OLLAMA_URL and "
+            "DAILY_PROBLEM_OLLAMA_API_KEY if needed. "
+            f"Details: {error}"
+        )
 
     if not REPO_DIR.exists():
         raise RuntimeError(
@@ -163,6 +245,10 @@ def git_sync():
             "Commit or stash your changes before "
             "running the generator."
         )
+
+    if SKIP_GIT_SYNC:
+        log("Skipping git pull (DAILY_PROBLEM_SKIP_GIT_SYNC=1).")
+        return
 
     log("Pulling latest changes...")
 
@@ -235,12 +321,19 @@ def call_ollama(prompt, temperature=0.4):
 
     body = json.dumps(payload).encode("utf-8")
 
+    headers = {
+        "Content-Type": "application/json"
+    }
+
+    if OLLAMA_API_KEY:
+        headers["Authorization"] = (
+            "Bearer " + OLLAMA_API_KEY
+        )
+
     request = urllib.request.Request(
         OLLAMA_URL,
         data=body,
-        headers={
-            "Content-Type": "application/json"
-        },
+        headers=headers,
         method="POST"
     )
 
@@ -546,7 +639,12 @@ def create_problem_files(problem, folder_name):
 
 def compile_solution(folder):
     source = folder / "solution.cpp"
-    executable = folder / "solution.exe"
+    executable_name = (
+        "solution.exe"
+        if os.name == "nt"
+        else "solution.out"
+    )
+    executable = folder / executable_name
 
     if executable.exists():
         executable.unlink()
@@ -1241,6 +1339,10 @@ def commit_generated_problem(title):
 # ============================================================
 
 def push_changes():
+    if SKIP_GIT_PUSH:
+        log("Skipping git push (DAILY_PROBLEM_SKIP_GIT_PUSH=1).")
+        return
+
     log(
         "Pushing to GitHub..."
     )
@@ -1360,14 +1462,26 @@ def main():
         )
 
         # 10. Add
-        stage_generated_problem(
-            generated_folder
-        )
+        if SKIP_GIT_COMMIT:
+            log(
+                "Skipping git add "
+                "(DAILY_PROBLEM_SKIP_GIT_COMMIT=1)."
+            )
+        else:
+            stage_generated_problem(
+                generated_folder
+            )
 
         # 11. Commit
-        commit_generated_problem(
-            problem["title"]
-        )
+        if SKIP_GIT_COMMIT:
+            log(
+                "Skipping git commit "
+                "(DAILY_PROBLEM_SKIP_GIT_COMMIT=1)."
+            )
+        else:
+            commit_generated_problem(
+                problem["title"]
+            )
 
         # 12. Push
         push_changes()
@@ -1389,9 +1503,14 @@ def main():
             f"Folder: problems/{folder_name}"
         )
 
-        print(
-            "GitHub: pushed successfully"
-        )
+        if SKIP_GIT_PUSH:
+            print(
+                "GitHub push: skipped by config"
+            )
+        else:
+            print(
+                "GitHub: pushed successfully"
+            )
 
         print()
 

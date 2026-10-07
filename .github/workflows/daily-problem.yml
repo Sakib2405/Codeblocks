@@ -1,0 +1,74 @@
+name: Daily Problem Generator
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '15 1 * * *'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: daily-problem-generator
+  cancel-in-progress: false
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Ensure compiler exists
+        run: g++ --version
+
+      - name: Validate required secrets
+        env:
+          DAILY_PROBLEM_OLLAMA_URL: ${{ secrets.DAILY_PROBLEM_OLLAMA_URL }}
+        run: |
+          if [ -z "$DAILY_PROBLEM_OLLAMA_URL" ]; then
+            echo "Missing required secret: DAILY_PROBLEM_OLLAMA_URL"
+            echo "Set repository secret DAILY_PROBLEM_OLLAMA_URL to your reachable /api/generate endpoint."
+            exit 1
+          fi
+
+      - name: Generate daily problem
+        env:
+          DAILY_PROBLEM_REPO_DIR: ${{ github.workspace }}
+          DAILY_PROBLEM_TARGET_SUBDIR: problems
+          DAILY_PROBLEM_OLLAMA_URL: ${{ secrets.DAILY_PROBLEM_OLLAMA_URL }}
+          DAILY_PROBLEM_OLLAMA_MODEL: ${{ vars.DAILY_PROBLEM_OLLAMA_MODEL || 'qwen2.5-coder:1.5b' }}
+          DAILY_PROBLEM_OLLAMA_API_KEY: ${{ secrets.DAILY_PROBLEM_OLLAMA_API_KEY }}
+          DAILY_PROBLEM_SKIP_GIT_SYNC: '1'
+          DAILY_PROBLEM_SKIP_GIT_COMMIT: '1'
+          DAILY_PROBLEM_SKIP_GIT_PUSH: '1'
+        run: python "${{ github.workspace }}/automation/daily_problem.py"
+
+      - name: Commit and push generated changes
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if git diff --quiet -- automation problems; then
+            echo "No changes detected in automation/ or problems/."
+            exit 0
+          fi
+
+          git add -- automation problems
+          git commit -m "chore: add daily generated problem"
+          git push
+
+      - name: Retry guidance on failure
+        if: failure()
+        run: |
+          echo "Workflow failed. Review job logs in Actions and re-run failed jobs if needed."
