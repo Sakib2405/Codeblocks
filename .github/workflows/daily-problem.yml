@@ -31,17 +31,20 @@ jobs:
       - name: Ensure compiler exists
         run: g++ --version
 
-      - name: Validate required secrets
+      - name: Check generator configuration
+        id: generator_config
         env:
           DAILY_PROBLEM_OLLAMA_URL: ${{ secrets.DAILY_PROBLEM_OLLAMA_URL }}
         run: |
           if [ -z "$DAILY_PROBLEM_OLLAMA_URL" ]; then
-            echo "Missing required secret: DAILY_PROBLEM_OLLAMA_URL"
-            echo "Set repository secret DAILY_PROBLEM_OLLAMA_URL to your reachable /api/generate endpoint."
-            exit 1
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Skipping daily problem generation because DAILY_PROBLEM_OLLAMA_URL is not set."
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Generate daily problem
+        if: steps.generator_config.outputs.configured == 'true'
         env:
           DAILY_PROBLEM_REPO_DIR: ${{ github.workspace }}
           DAILY_PROBLEM_TARGET_SUBDIR: problems
@@ -54,6 +57,7 @@ jobs:
         run: python "${{ github.workspace }}/automation/daily_problem.py"
 
       - name: Commit and push generated changes
+        if: steps.generator_config.outputs.configured == 'true'
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
